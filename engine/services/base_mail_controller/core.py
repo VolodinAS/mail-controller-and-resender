@@ -1,5 +1,7 @@
 import imaplib
+import os
 import smtplib
+import subprocess
 import traceback
 from abc import ABC
 from email import policy
@@ -190,3 +192,28 @@ class BaseMailController(ABC):
         
         smtp_conn.send_message(msg)
         loginf(f"Email sent to {recipient} with subject: '{final_subject}'")
+    
+    def send_telegram_alert(self, message: str) -> None:
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_ids_str = os.getenv("TELEGRAM_ADMIN_CHAT_IDS", "")
+        
+        if not token or not chat_ids_str.strip():
+            return  # Telegram не настроен — просто молча выходим
+        
+        chat_ids = [cid.strip() for cid in chat_ids_str.split(",") if cid.strip()]
+        
+        for chat_id in chat_ids:
+            try:
+                subprocess.run(
+                    [
+                        "curl", "-s", "-X", "POST",
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        "-d", f"chat_id={chat_id}",
+                        "-d", f"text={message}",
+                        "-d", "parse_mode=HTML"
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            except Exception as e:
+                logerr(f"Failed to send Telegram alert to {chat_id}: {e}")

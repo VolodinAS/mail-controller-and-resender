@@ -1,4 +1,5 @@
 import os
+import traceback
 
 from dotenv import load_dotenv
 from onco_cola_utils import logerr, loginf, value_to_bool
@@ -46,14 +47,23 @@ class BegetMailController(BaseMailController):
                 self.imap_host, self.imap_port, self.email_user, self.email_password
             )
         except Exception as e:
-            logerr(f"IMAP connection failed: {e}")
+            error_msg = f"ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n❌ IMAP connection failed: {e}"
+            logerr(error_msg)
+            self.send_telegram_alert(error_msg)
             return
         
         try:
-            for uid, raw_email in self.fetch_unread_messages(imap_conn, self.expected_sender):
+            uids_and_emails = list(self.fetch_unread_messages(imap_conn, self.expected_sender))
+            
+            if not uids_and_emails:
+                msg = "ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n📭 Нет новых писем для обработки."
+                loginf(msg)
+                self.send_telegram_alert(msg)
+                return
+            
+            for uid, raw_email in uids_and_emails:
                 loginf(f"Processing email UID {uid}")
                 
-                # Парсим письмо один раз
                 from email.parser import BytesParser
                 from email import policy
                 parser = BytesParser(policy=policy.default)
@@ -62,7 +72,7 @@ class BegetMailController(BaseMailController):
                 original_subject = msg.get("Subject", "[No Subject]")
                 loginf(f"Original email subject: '{original_subject}'")
                 
-                # ✅ Извлекаем тело письма
+                # Извлекаем тело
                 original_body = ""
                 if msg.is_multipart():
                     for part in msg.walk():
@@ -77,7 +87,12 @@ class BegetMailController(BaseMailController):
                 
                 attachments = self.extract_attachments(raw_email, self.attachment_pattern)
                 if not attachments:
+                    warn_msg = (
+                        f"ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n📭 Письмо UID {uid} получено, но вложений нет.\n"
+                        f"Тема: {original_subject}"
+                    )
                     loginf("No attachments found, skipping")
+                    self.send_telegram_alert(warn_msg)
                     continue
                 
                 try:
@@ -85,7 +100,9 @@ class BegetMailController(BaseMailController):
                         self.smtp_host, self.smtp_port, self.email_user, self.email_password
                     )
                 except Exception as e:
-                    logerr(f"SMTP connection failed: {e}")
+                    error_msg = f"ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n❌ SMTP connection failed for UID {uid}: {e}"
+                    logerr(error_msg)
+                    self.send_telegram_alert(error_msg)
                     continue
                 
                 try:
@@ -102,17 +119,43 @@ class BegetMailController(BaseMailController):
                         original_body=original_body,
                     )
                     
-                    # ✅ Управление статусом прочтения
+                    success_msg = (
+                        f"ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n✅ Письмо UID {uid} успешно переслано!\n"
+                        f"Тема: {original_subject}\n"
+                        f"Вложений: {len(attachments)}"
+                    )
+                    loginf("Email forwarded successfully")
+                    self.send_telegram_alert(success_msg)
+                    
+                    # Управление статусом прочтения
                     if self.set_unread:
                         imap_conn.store(uid, "-FLAGS", "\\Seen")
                         loginf(f"Restored 'unread' status for UID {uid}")
                     else:
-                        # Оставляем как прочитанное (или ничего не делаем — IMAP мог уже пометить)
                         imap_conn.store(uid, "+FLAGS", "\\Seen")
                         loginf(f"Marked UID {uid} as read")
                 
+                except Exception as e:
+                    fail_msg = (
+                        f"ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n❌ Не удалось переслать письмо UID {uid}.\n"
+                        f"Тема: {original_subject}\n"
+                        f"Ошибка: {e}"
+                    )
+                    logerr(f"Forwarding failed: {e}")
+                    self.send_telegram_alert(fail_msg)
+                
                 finally:
                     smtp_conn.quit()
+        
+        except Exception as e:
+            critical_error = f"ПЕРЕСЫЛКА ОТ ВЕКТОР:\n\n🔥 Критическая ошибка при обработке писем: {e}"
+            logerr(critical_error)
+            logerr(traceback.format_exc())
+            self.send_telegram_alert(critical_error)
+        
         finally:
-            imap_conn.close()
-            imap_conn.logout()
+            try:
+                imap_conn.close()
+                imap_conn.logout()
+            except Exception as e:
+                logerr(f"Error closing IMAP connection: {e}")
