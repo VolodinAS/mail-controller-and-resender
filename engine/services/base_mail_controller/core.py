@@ -4,13 +4,14 @@ import smtplib
 import subprocess
 import traceback
 from abc import ABC
+from datetime import date, datetime
 from email import policy
 from email.header import decode_header
 from email.parser import BytesParser
 from email.utils import parseaddr
 from typing import Iterator, Optional
 
-from onco_cola_utils import logerr, loginf
+from onco_cola_utils import log, logerr, loginf, logwarn
 
 
 class BaseMailController(ABC):
@@ -153,6 +154,67 @@ class BaseMailController(ABC):
                 attachments.append((filename, part.get_payload(decode=True)))
         return attachments
     
+    @staticmethod
+    def _extract_email_date(email_date: datetime | str | None) -> date:
+        """
+        Извлекает дату из письма в формате date.
+        Поддерживает: datetime, str (RFC2822, ISO), None.
+        """
+        from datetime import date, datetime
+        from email.utils import parsedate_to_datetime
+        import re
+        
+        if email_date is None:
+            logwarn("_extract_email_date: email_date is None, using today")
+            return date.today()
+        
+        if isinstance(email_date, datetime):
+            return email_date.date()
+        
+        if isinstance(email_date, date):
+            return email_date
+        
+        if isinstance(email_date, str):
+            loginf(f"_extract_email_date: parsing string '{email_date}'")
+            
+            # 1. Пробуем email.utils.parsedate_to_datetime (RFC2822)
+            try:
+                parsed_dt = parsedate_to_datetime(email_date)
+                loginf(
+                    f"_extract_email_date: parsed via parsedate_to_datetime -> {parsed_dt.date()}"
+                )
+                return parsed_dt.date()
+            except (ValueError, TypeError, IndexError) as e:
+                logwarn(f"_extract_email_date: parsedate_to_datetime failed: {e}")
+            
+            # 2. Пробуем извлечь дату через регекс (формат: 2026-03-22)
+            match = re.search(r'(\d{4}-\d{2}-\d{2})', email_date)
+            if match:
+                try:
+                    extracted = date.fromisoformat(match.group(1))
+                    loginf(f"_extract_email_date: extracted via regex -> {extracted}")
+                    return extracted
+                except ValueError as e:
+                    logwarn(f"_extract_email_date: fromisoformat failed: {e}")
+            
+            # 3. Пробуем dateutil.parser (если установлен)
+            try:
+                from dateutil import parser as date_parser
+                parsed_dt = date_parser.parse(email_date)
+                loginf(f"_extract_email_date: parsed via dateutil -> {parsed_dt.date()}")
+                return parsed_dt.date()
+            except ImportError:
+                logwarn("_extract_email_date: dateutil not installed, skipping")
+            except (ValueError, TypeError) as e:
+                logwarn(f"_extract_email_date: dateutil.parser failed: {e}")
+            
+            # Fallback
+            logerr(f"_extract_email_date: all parsers failed for '{email_date}', using today")
+            return date.today()
+        
+        logerr(f"_extract_email_date: unknown type {type(email_date)}, using today")
+        return date.today()
+    
     def send_email_with_attachment(
         self,
         smtp_conn: smtplib.SMTP | smtplib.SMTP_SSL,
@@ -165,33 +227,56 @@ class BaseMailController(ABC):
         original_subject: str | None = None,
         same_body: bool = True,
         original_body: str | None = None,
+        email_date: date | str | None = None,
     ) -> None:
         from email.message import EmailMessage
+        from pathlib import Path
+        import os
+        
+        # ← ОТЛАДКА: логируем входные параметры
+        loginf(
+            f"[DEBUG] send_email_with_attachment: email_date={email_date!r}, type={type(email_date)}"
+        )
         
         final_subject = original_subject if same_subject and original_subject else subject
-        final_body = original_body if same_body and original_body is not None else body  # ✅
+        final_body = original_body if same_body and original_body is not None else body
         
         msg = EmailMessage()
         msg["From"] = sender
         msg["To"] = recipient
         msg["Subject"] = final_subject
-        msg.set_content(final_body)  # ✅ Используем final_body, а не body
+        msg.set_content(final_body)
+        
+        base_dir_str = os.getenv('ATTACHMENT_STORAGE_DIR', 'files')
+        base_path = Path(base_dir_str)
+        if not base_path.is_absolute():
+            base_path = Path.cwd() / base_path
+        
+        # ← ОТЛАДКА: извлекаем дату с логированием
+        folder_date = self._extract_email_date(email_date)
+        date_folder = folder_date.strftime("%Y-%m-%d")
+        loginf(f"[DEBUG] folder_date={folder_date}, date_folder={date_folder}")
+        
+        target_dir = base_path / date_folder
+        target_dir.mkdir(parents=True, exist_ok=True)
         
         for filename, content in attachments:
+            file_path = target_dir / filename
+            if file_path.exists():
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H%M%S")
+                file_path = target_dir / f"{timestamp}_{filename}"
+            file_path.write_bytes(content)
+            log(f"File saved to: {file_path.resolve()}")
+            
             if filename.lower().endswith(".zip"):
                 maintype, subtype = "application", "zip"
             else:
                 maintype, subtype = "application", "octet-stream"
-            
-            msg.add_attachment(
-                content,
-                maintype=maintype,
-                subtype=subtype,
-                filename=filename,
-            )
+            msg.add_attachment(content, maintype=maintype, subtype=subtype, filename=filename)
         
         smtp_conn.send_message(msg)
-        loginf(f"Email sent to {recipient} with subject: '{final_subject}'")
+        loginf(f"Email sent to {recipient} with subject: '{final_subject}' (folder: {date_folder})")
     
     def send_telegram_alert(self, message: str) -> None:
         token = os.getenv("TELEGRAM_BOT_TOKEN")
