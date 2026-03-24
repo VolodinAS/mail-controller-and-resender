@@ -2,7 +2,7 @@ import os
 import traceback
 
 from dotenv import load_dotenv
-from onco_cola_utils import logerr, loginf, value_to_bool
+from onco_cola_utils import logerr, loginf, logwarn, value_to_bool
 
 from engine.services.base_mail_controller import BaseMailController
 
@@ -69,6 +69,25 @@ class BegetMailController(BaseMailController):
                 parser = BytesParser(policy=policy.default)
                 msg = parser.parsebytes(raw_email)
                 
+                from email.utils import parsedate_to_datetime
+                from datetime import date
+                
+                email_date_header = msg.get("Date")
+                loginf(f"[DEBUG] Email Date header: {email_date_header!r}")
+                
+                try:
+                    if email_date_header:
+                        email_datetime = parsedate_to_datetime(email_date_header)
+                        email_date_for_folder = email_datetime.date()
+                    else:
+                        email_date_for_folder = date.today()
+                        logwarn("Date header is missing, using today")
+                except Exception as e:
+                    logwarn(f"Failed to parse Date header: {e}, using today")
+                    email_date_for_folder = date.today()
+                
+                loginf(f"[DEBUG] Parsed email_date_for_folder: {email_date_for_folder}")
+                
                 original_subject = msg.get("Subject", "[No Subject]")
                 loginf(f"Original email subject: '{original_subject}'")
                 
@@ -117,6 +136,7 @@ class BegetMailController(BaseMailController):
                         original_subject=original_subject,
                         same_body=self.same_body,
                         original_body=original_body,
+                        email_date=email_date_for_folder,
                     )
                     
                     success_msg = (
